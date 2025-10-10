@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +21,11 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    int ret_val = system(cmd);
+    if (ret_val == 0)
+        return true;
+    
+    return false;
 }
 
 /**
@@ -47,7 +55,7 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 /*
  * TODO:
@@ -59,9 +67,41 @@ bool do_exec(int count, ...)
  *
 */
 
-    va_end(args);
+    pid_t pid;
+    pid = fork();
+    if (pid == -1)
+    {
+        va_end(args);
+        return false;
+    } else if (pid == 0)
+    {
+        // child
+        execv(command[0], command);
 
-    return true;
+        // handle failure
+        perror("execv");
+        va_end(args);
+        exit(-1);
+    } else
+    {
+        // parent
+        int status;
+        wait(&status);
+
+        if (WIFEXITED(status))
+        {
+            if (WEXITSTATUS(status) == 0)
+            {
+                va_end(args);
+                return true;
+            }
+            
+            va_end(args);
+            return false;
+        }
+        va_end(args);
+        return false;
+    }
 }
 
 /**
@@ -82,7 +122,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
 
 
 /*
@@ -92,8 +132,51 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    pid_t pid;
+    pid = fork();
+    if (pid == -1)
+    {
+        va_end(args);
+        return false;
+    } else if (pid == 0)
+    {
+        // child
+        int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+        if (fd < 0) 
+        { 
+            perror("open"); 
+            return false;
+        }
+        if (dup2(fd, 1) < 0)
+        { 
+            perror("dup2");
+            return false;
+        }
+        close(fd);
+        execv(command[0], command);
 
-    va_end(args);
+        // handle failure
+        perror("execv");
+        va_end(args);
+        close(fd);
+        exit(-1);
+    } else
+    {
+        // parent
+        int status;
+        wait(&status);
 
-    return true;
+        if (WIFEXITED(status))
+        {
+            if (WEXITSTATUS(status) == 0)
+            {
+                va_end(args);
+                return true;
+            }
+            va_end(args);
+            return false;
+        }
+        va_end(args);
+        return false;
+    }
 }
