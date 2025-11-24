@@ -1,33 +1,17 @@
-# Usage:
-#   make                       # native build (gcc)
-#   make clean                 # remove writer and *.o
-#   make CROSS_COMPILE=aarch64-none-linux-gnu-   # cross-build
+CC ?= $(CROSS_COMPILE)gcc
+CFLAGS ?= -Wall -Werror
+LDFLAGS ?= 
+TARGET ?= aesdsocket
+SRC ?= aesdsocket.c
+OBJ ?= $(SRC:.c=.o)
 
-# If CROSS_COMPILE is set with aarch64-none-linux-gnu-, CC becomes that triplet + gcc
-CROSS_COMPILE ?=
-CC := $(CROSS_COMPILE)gcc
+all: $(TARGET)
 
-CFLAGS  ?= -Wall -Werror -O2 -g
-LDFLAGS ?=
-LDLIBS  ?=
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(INCLUDES) -o $(TARGET) $(OBJ)
 
-TARGET := aesdsocket
-SRCS   := aesdsocket.c
-OBJS   := $(SRCS:.c=.o)
-
-# Default target
-.DEFAULT_GOAL := $(TARGET)
-
-# Build the app
-$(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-
-# Compile .c -> .o
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-.PHONY: all clean
-all: $(TARGET)
-
 clean:
-	$(RM) -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJ)
