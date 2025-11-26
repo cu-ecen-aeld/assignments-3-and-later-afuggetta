@@ -28,7 +28,7 @@
 #include <linux/mutex.h>
 #endif
 #include "aesd-circular-buffer.h"
-
+#define WAITING_BUFFER_SIZE 50
 struct aesd_dev
 {
     struct cdev cdev;                     /* Char device structure      */
