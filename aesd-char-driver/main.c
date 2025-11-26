@@ -21,6 +21,7 @@
 #include "aesdchar.h"
 #include "aesd-circular-buffer.h"
 
+#define AESD_DEBUG 1
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -61,7 +62,7 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
         return -ERESTARTSYS;
 
     offset = *f_pos;
-
+    PDEBUG("COUNT is %d", count);
     while (count > 0) {
         entry = aesd_circular_buffer_find_entry_offset_for_fpos(
                     &dev->buffer, offset, &entry_off);
