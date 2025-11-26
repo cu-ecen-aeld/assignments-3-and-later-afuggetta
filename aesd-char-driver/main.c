@@ -44,12 +44,10 @@ static int aesd_release(struct inode *inode, struct file *filp)
 }
 
 
-static ssize_t aesd_read(struct file *filp, char __user *buf,
-                         size_t count, loff_t *f_pos)
+static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
     struct aesd_dev *dev = filp->private_data;
     ssize_t total_read = 0;
-    size_t offset;
     struct aesd_buffer_entry *entry;
     size_t entry_off;
     size_t to_copy;
@@ -57,7 +55,7 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     if(mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer);
+    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_off);
     if(!entry || entry->size == 0)
     {
         total_read = 0;
