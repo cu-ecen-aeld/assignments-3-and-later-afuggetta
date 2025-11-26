@@ -41,7 +41,6 @@ static struct client_thread *thread_list_head = NULL;
 
 /* Forward declarations */
 static void *client_thread_func(void *arg);
-static void *timestamp_thread_func(void *arg);
 
 /* ========== Signal handling ========== */
 
@@ -144,64 +143,6 @@ static int send_file_to_client_nolock(int client_fd)
 
     close(fd);
     return (r < 0) ? -1 : 0;
-}
-
-/* ========== Timer thread: append timestamp every 10s ========== */
-
-static void *timestamp_thread_func(void *arg)
-{
-    (void)arg;
-
-    while (!exit_requested) {
-        /* Sleep in 1s chunks so we respond more quickly to exit */
-        for (int i = 0; i < 10 && !exit_requested; i++) {
-            sleep(1);
-        }
-        if (exit_requested) break;
-
-        time_t now = time(NULL);
-        struct tm t;
-        if (!localtime_r(&now, &t)) {
-            syslog(LOG_USER | LOG_ERR, "localtime_r failed: %m");
-            continue;
-        }
-
-        /* RFC 2822-style format: "%a, %d %b %Y %T %z" */
-        char timebuf[128];
-        if (strftime(timebuf, sizeof(timebuf), "%a, %d %b %Y %T %z", &t) == 0) {
-            syslog(LOG_USER | LOG_ERR, "strftime failed");
-            continue;
-        }
-
-        char outbuf[256];
-        int len = snprintf(outbuf, sizeof(outbuf), "timestamp:%s\n", timebuf);
-        if (len < 0 || (size_t)len >= sizeof(outbuf)) {
-            syslog(LOG_USER | LOG_ERR, "snprintf for timestamp failed");
-            continue;
-        }
-
-        if (pthread_mutex_lock(&data_mutex) != 0) {
-            syslog(LOG_USER | LOG_ERR, "pthread_mutex_lock failed in timer thread");
-            continue;
-        }
-
-        int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd == -1) {
-            syslog(LOG_USER | LOG_ERR, "open %s in timer thread failed: %m", DATAFILE);
-            pthread_mutex_unlock(&data_mutex);
-            continue;
-        }
-
-        ssize_t w = write(fd, outbuf, (size_t)len);
-        if (w < 0 || w != len) {
-            syslog(LOG_USER | LOG_ERR, "timestamp write failed: %m");
-        }
-
-        close(fd);
-        pthread_mutex_unlock(&data_mutex);
-    }
-
-    return NULL;
 }
 
 /* ========== Daemonize ========== */
@@ -430,14 +371,6 @@ int main(int argc, char *argv[])
     // Make sure data file exists
     int df = open(DATAFILE, O_CREAT | O_APPEND, 0644);
     if (df != -1) close(df);
-
-    /* Start timestamp thread */
-    if (pthread_create(&timer_thread, NULL, timestamp_thread_func, NULL) != 0) {
-        syslog(LOG_USER | LOG_ERR, "pthread_create for timer thread failed");
-        close(server_fd);
-        closelog();
-        return -1;
-    }
 
     while (!exit_requested) {
         struct sockaddr_storage client_addr;
