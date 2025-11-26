@@ -44,32 +44,50 @@ static int aesd_release(struct inode *inode, struct file *filp)
 }
 
 
-static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t aesd_read(struct file *filp, char __user *buf,
+                         size_t count, loff_t *f_pos)
 {
     struct aesd_dev *dev = filp->private_data;
     ssize_t total_read = 0;
+    size_t offset;
     struct aesd_buffer_entry *entry;
     size_t entry_off;
     size_t to_copy;
 
-    if(mutex_lock_interruptible(&dev->lock))
+    if (!dev)
+        return -EFAULT;
+
+    if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_off);
-    if(!entry || entry->size == 0)
-    {
-        total_read = 0;
-        goto out_unlock;
+    offset = *f_pos;
+
+    while (count > 0) {
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->buffer, offset, &entry_off);
+        if (!entry || entry->size == 0) {
+            /* No more data available */
+            break;
+        }
+
+        to_copy = entry->size - entry_off;
+        if (to_copy > count)
+            to_copy = count;
+
+        if (copy_to_user(buf + total_read,
+                         entry->buffptr + entry_off,
+                         to_copy)) {
+            if (total_read == 0)
+                total_read = -EFAULT;
+            goto out_unlock;
+        }
+
+        total_read += to_copy;
+        offset     += to_copy;
+        count      -= to_copy;
     }
 
-    if (copy_to_user(buf, entry->buffptr + entry_off, to_copy)) {
-        if (total_read == 0)
-            total_read = -EFAULT;
-        goto out_unlock;
-    }
-
-    *f_pos += to_copy;
-    total_read = to_copy;
+    *f_pos = offset;
 
 out_unlock:
     mutex_unlock(&dev->lock);
@@ -81,82 +99,106 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
 {
     struct aesd_dev *dev = filp->private_data;
     ssize_t retval = count;
+    char *user_buf = NULL;
+    char *combined = NULL;
+    size_t needed;
+    size_t pos = 0;
+    size_t i;
+
+    (void)f_pos; /* f_pos ignored for this assignment */
 
     if (!dev)
         return -EFAULT;
 
-    if(mutex_lock_interruptible(&dev->lock))
+    if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    size_t needed;
-    char *newbuf;
-
-    needed = dev->partial_size + count;
-
-    newbuf = kmalloc(needed, GFP_KERNEL);
-    if (!newbuf)
-    {
+    /* Copy user data into kernel buffer */
+    user_buf = kmalloc(count, GFP_KERNEL);
+    if (!user_buf) {
         retval = -ENOMEM;
         goto out_unlock;
     }
 
-    if (dev->partial_buf)
-        memcpy(newbuf, dev->partial_buf, dev->partial_size);
-
-    if (copy_from_user(newbuf + dev->partial_size, buf, count))
-    {
+    if (copy_from_user(user_buf, buf, count)) {
         retval = -EFAULT;
         goto out_unlock;
     }
 
-    for (size_t i = 0; i < needed; i++) {
-        if (newbuf[i] != '\n')
-            continue;
-
-        struct aesd_buffer_entry new_entry;
-        new_entry.size = i + 1;
-        new_entry.buffptr = kmalloc(new_entry.size, GFP_KERNEL);
-        if (!new_entry.buffptr) {
-            retval = -ENOMEM;
-            goto out_unlock;
-        }
-
-        memcpy((char *)new_entry.buffptr, newbuf, new_entry.size);
-
-        if (dev->buffer.full) {
-            kfree((void *)dev->buffer.entry[dev->buffer.out_offs].buffptr);
-        }
-
-        aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
-
-        dev->partial_size = needed - (i + 1);
-        if (dev->partial_size > 0)
-        {
-            dev->partial_buf = kmalloc(dev->partial_size, GFP_KERNEL);
-            if (!dev->partial_buf)
-            {
-                retval = -ENOMEM;
-                goto out_unlock;
-            }
-            memcpy(dev->partial_buf, newbuf + i + 1, dev->partial_size);
-        } else
-        {
-            dev->partial_buf = NULL;
-            dev->partial_size = 0;
-        }
-
-        retval = count;
+    /* Build combined = partial_buf + user_buf */
+    needed = dev->partial_size + count;
+    combined = kmalloc(needed, GFP_KERNEL);
+    if (!combined) {
+        retval = -ENOMEM;
         goto out_unlock;
     }
 
+    if (dev->partial_buf && dev->partial_size > 0)
+        memcpy(combined, dev->partial_buf, dev->partial_size);
+
+    memcpy(combined + dev->partial_size, user_buf, count);
+
+    /* We no longer need the old partial buffer */
     kfree(dev->partial_buf);
-    dev->partial_buf = kmalloc(needed, GFP_KERNEL);
-    memcpy(dev->partial_buf, newbuf, needed);
-    retval = count;
+    dev->partial_buf  = NULL;
+    dev->partial_size = 0;
+
+    /* Parse combined buffer for complete lines ending in '\n' */
+    pos = 0;
+    for (i = 0; i < needed; i++) {
+        if (combined[i] == '\n') {
+            size_t line_len = i - pos + 1; /* include '\n' */
+            struct aesd_buffer_entry new_entry;
+            struct aesd_buffer_entry *old_entry;
+
+            new_entry.buffptr = kmalloc(line_len, GFP_KERNEL);
+            if (!new_entry.buffptr) {
+                retval = -ENOMEM;
+                goto out_unlock;
+            }
+            new_entry.size = line_len;
+            memcpy((char *)new_entry.buffptr, combined + pos, line_len);
+
+            /*
+             * If the circular buffer is full, the next add will overwrite
+             * entry at buffer->in_offs. Free that entry's buffptr first.
+             */
+            if (dev->buffer.full) {
+                old_entry = &dev->buffer.entry[dev->buffer.in_offs];
+                if (old_entry->buffptr) {
+                    kfree(old_entry->buffptr);
+                    old_entry->buffptr = NULL;
+                    old_entry->size = 0;
+                }
+            }
+
+            aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
+
+            pos = i + 1; /* start of next potential line */
+        }
+    }
+
+    /* Whatever is left after the last '\n' is the new partial */
+    if (pos < needed) {
+        dev->partial_size = needed - pos;
+        dev->partial_buf  = kmalloc(dev->partial_size, GFP_KERNEL);
+        if (!dev->partial_buf) {
+            retval = -ENOMEM;
+            goto out_unlock;
+        }
+        memcpy(dev->partial_buf, combined + pos, dev->partial_size);
+    } else {
+        dev->partial_buf  = NULL;
+        dev->partial_size = 0;
+    }
+
+    /* retval is count, unless we encountered an error */
 
 out_unlock:
-    if (newbuf)
-        kfree(newbuf);
+    if (combined)
+        kfree(combined);
+    if (user_buf)
+        kfree(user_buf);
     mutex_unlock(&dev->lock);
     return retval;
 }
