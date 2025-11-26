@@ -31,13 +31,10 @@
 
 struct aesd_dev
 {
-    struct cdev cdev;                 /* Char device structure */
-    struct mutex lock;                /* Protects buffer + partial buffer */
-    struct aesd_circular_buffer buffer;
-
-    /* Buffer to accumulate a single command until '\n' is received */
-    char   *partial_buf;
-    size_t  partial_size;
+    struct mutex lock;                       
+    struct aesd_circular_buffer cmd_history; 
+    struct aesd_buffer_entry incomplete_cmd; 
+    struct cdev cdev;                     
 };
 
 
