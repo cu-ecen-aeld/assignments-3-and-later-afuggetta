@@ -54,7 +54,6 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     size_t entry_off;
     size_t to_copy;
 
-    printk(KERN_WARNING "ANDREA IS PRINTK FROM READ");
     if (!dev)
         return -EFAULT;
 
@@ -107,7 +106,6 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     size_t i;
 
     (void)f_pos; /* Ignored for this assignment */
-    printk(KERN_WARNING "ANDREA IS PRINTK FROM WRITE");
 
     if (!dev)
         return -EFAULT;
@@ -229,7 +227,6 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
 
 int aesd_init_module(void)
 {
-    printk(KERN_WARNING "ANDREA IS PRINTK FROM INIT");
     dev_t dev = 0;
     int result;
     result = alloc_chrdev_region(&dev, aesd_minor, 1,
