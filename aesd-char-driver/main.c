@@ -54,6 +54,7 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     size_t entry_off;
     size_t to_copy;
 
+    printk(KERN_INFO "ANDREA IS PRINTK FROM READ");
     if (!dev)
         return -EFAULT;
 
@@ -106,6 +107,7 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     size_t i;
 
     (void)f_pos; /* Ignored for this assignment */
+    printk(KERN_INFO "ANDREA IS PRINTK FROM WRITE");
 
     if (!dev)
         return -EFAULT;
