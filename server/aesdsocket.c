@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #ifndef USE_AESD_CHAR_DEVICE
-#define USE_AESD_CHAR_DEVICE 1   /* default ON for assignment 8 */
+#define USE_AESD_CHAR_DEVICE 1   /* default ON */
 #endif
 
 #define LISTEN_PORT 9000
@@ -325,6 +325,7 @@ static void *client_thread_func(void *arg)
                     break;
                 }
 
+#if !USE_AESD_CHAR_DEVICE
                 int afd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
                 if (afd == -1) {
                     syslog(LOG_USER | LOG_ERR, "open %s for append failed: %m", DATAFILE);
@@ -342,7 +343,7 @@ static void *client_thread_func(void *arg)
                     break;
                 }
                 close(afd);
-
+#endif
                 if (send_file_to_client_nolock(client_fd) == -1) {
                     pthread_mutex_unlock(&data_mutex);
                     client_open = false;
