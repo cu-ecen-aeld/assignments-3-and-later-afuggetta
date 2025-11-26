@@ -28,209 +28,176 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
-int aesd_open(struct inode *inode, struct file *filp)
-{
-    PDEBUG("open");
-    /**
-     * TODO: handle open
-     */
-    filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
-    return 0;
-}
-
-int aesd_release(struct inode *inode, struct file *filp)
-{
-    PDEBUG("release");
-    /**
-     * TODO: handle release
-     */
-    filp->private_data = NULL;
-    return 0;
-}
-
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static int aesd_open(struct inode *inode, struct file *filp)
 {
     struct aesd_dev *dev;
-    struct aesd_buffer_entry *entry = NULL;
-    size_t entry_byte_off = 0;
-    size_t bytes_avail_in_entry;
-    size_t bytes_to_copy;
-    ssize_t ret;
-    PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
-    /**
-     * TODO: handle read
-     */
-   
-   if (!filp || !buf || !f_pos) {
-        PDEBUG("read: invalid args filp=%p buf=%p f_pos=%p", filp, buf, f_pos);
-        return -EINVAL;
-    }
-    if (count == 0)
-        return 0;
-
-    dev = filp->private_data;
-
-
-    if (mutex_lock_interruptible(&dev->lock)) {
-        PDEBUG("read: mutex_lock_interruptible interrupted");
-        return -ERESTARTSYS;
-    }
-
-    /* Map the linear file position */
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->cmd_history, (size_t)*f_pos, &entry_byte_off);
-    if (!entry) {
-        mutex_unlock(&dev->lock);
-        return 0; 
-    }
-
-    bytes_avail_in_entry = entry->size - entry_byte_off;
-    bytes_to_copy = (bytes_avail_in_entry < count) ? bytes_avail_in_entry : count;
-
-    if (copy_to_user(buf, (const char *)entry->buffptr + entry_byte_off, bytes_to_copy)) 
-    {
-        PDEBUG("read: copy_to_user failed (req=%zu)", bytes_to_copy);
-        mutex_unlock(&dev->lock);
-        return -EFAULT;
-    }
-
-    *f_pos += bytes_to_copy;
-    ret = (ssize_t)bytes_to_copy;
-
-    PDEBUG("read: copied=%zu new f_pos=%lld", bytes_to_copy, *f_pos);
-    mutex_unlock(&dev->lock);
-    return ret;
+    dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
+    filp->private_data = dev;
+    return 0;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count, loff_t *f_pos)
+static int aesd_release(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+
+static ssize_t aesd_read(struct file *filp, char __user *buf,
+                         size_t count, loff_t *f_pos)
 {
     struct aesd_dev *dev = filp->private_data;
-    char *kbuf = NULL;
-    ssize_t retval = count;
-    void *newptr;
-    size_t newsize;
+    ssize_t total_read = 0;
+    size_t offset;
+    struct aesd_buffer_entry *entry;
+    size_t entry_off;
+    size_t to_copy;
 
-    if (!filp || !ubuf || !f_pos) {
-        PDEBUG("write: invalid args filp=%p buf=%p f_pos=%p", filp, ubuf, f_pos);
-        return -EINVAL;
-    }
-
-    if (count == 0)
-        return 0;
-
-    dev = filp->private_data;
     if (!dev)
         return -EFAULT;
 
-    kbuf = kmalloc(count, GFP_KERNEL);
-    if (!kbuf) {
-        PDEBUG("write: kmalloc failed for %zu bytes", count);
-        return -ENOMEM;
+    if (count == 0)
+        return 0;
+
+    mutex_lock(&dev->lock);
+
+    offset = *f_pos;
+
+    while (count > 0) {
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->circbuf, offset, &entry_off);
+        if (!entry)
+            break; /* no more data => EOF */
+
+        to_copy = entry->size - entry_off;
+        if (to_copy > count)
+            to_copy = count;
+
+        if (copy_to_user(buf, entry->buffptr + entry_off, to_copy)) {
+            if (total_read == 0)
+                total_read = -EFAULT;
+            goto out_unlock;
+        }
+
+        buf        += to_copy;
+        count      -= to_copy;
+        offset     += to_copy;
+        total_read += to_copy;
     }
 
-    if (copy_from_user(kbuf, ubuf, count)) {
-        PDEBUG("write: copy_from_user failed");
-        kfree(kbuf);
+    *f_pos = offset;
+
+out_unlock:
+    mutex_unlock(&dev->lock);
+    return total_read;
+}
+
+
+static int aesd_append_partial(struct aesd_dev *dev,
+                               const char __user *buf,
+                               size_t count)
+{
+    size_t needed;
+    char *newbuf;
+
+    if (!dev || !buf || count == 0)
+        return 0;
+
+    needed = dev->partial_size + count;
+
+    if (needed > dev->partial_capacity) {
+        size_t new_cap = dev->partial_capacity ?
+                         dev->partial_capacity * 2 :
+                         needed;
+        if (new_cap < needed)
+            new_cap = needed;
+
+        newbuf = kmalloc(new_cap, GFP_KERNEL);
+        if (!newbuf)
+            return -ENOMEM;
+
+        if (dev->partial_buf && dev->partial_size)
+            memcpy(newbuf, dev->partial_buf, dev->partial_size);
+
+        kfree(dev->partial_buf);
+        dev->partial_buf      = newbuf;
+        dev->partial_capacity = new_cap;
+    }
+
+    if (copy_from_user(dev->partial_buf + dev->partial_size, buf, count))
         return -EFAULT;
+
+    dev->partial_size += count;
+
+    return 0;
+}
+
+static ssize_t aesd_write(struct file *filp, const char __user *buf,
+                          size_t count, loff_t *f_pos)
+{
+    struct aesd_dev *dev = filp->private_data;
+    ssize_t retval = count;
+    int err;
+    char *newline;
+    size_t cmd_len;
+    struct aesd_buffer_entry new_entry;
+    struct aesd_buffer_entry *slot_to_free;
+
+    if (!dev)
+        return -EFAULT;
+
+    mutex_lock(&dev->lock);
+
+    err = aesd_append_partial(dev, buf, count);
+    if (err < 0) {
+        retval = err;
+        goto out_unlock;
     }
 
-    if (mutex_lock_interruptible(&dev->lock)) {
-        PDEBUG("write: mutex_lock_interruptible interrupted");
-        kfree(kbuf);
-        return -ERESTARTSYS;
-    }
+    while (1) {
+        newline = memchr(dev->partial_buf, '\n', dev->partial_size);
+        if (!newline)
+            break; 
 
+        cmd_len = (newline - dev->partial_buf) + 1;
 
-    /* Append this user chunk to the accumulating buffer */
-    newsize = dev->incomplete_cmd.size + count;
-    newptr  = krealloc((void *)dev->incomplete_cmd.buffptr, newsize, GFP_KERNEL);
-    if (!newptr) 
-    {
-      retval = -ENOMEM; 
-      goto out_unlock_free; 
-    }
+        new_entry.buffptr = kmalloc(cmd_len, GFP_KERNEL);
+        if (!new_entry.buffptr) {
+            retval = -ENOMEM;
+            goto out_unlock;
+        }
 
-    dev->incomplete_cmd.buffptr = (const char *)newptr;
+        memcpy((char *)new_entry.buffptr, dev->partial_buf, cmd_len);
+        new_entry.size = cmd_len;
 
-    memcpy((char *)dev->incomplete_cmd.buffptr + dev->incomplete_cmd.size, kbuf, count);
-
-    dev->incomplete_cmd.size = newsize;
-
-    /*complete commands present in the accumulated buffer */
-    for (;;) {
-        char *base = (char *)dev->incomplete_cmd.buffptr;
-        char *nl;
-
-        if (!base || dev->incomplete_cmd.size == 0)
-         break;
-        nl = memchr(base, '\n', dev->incomplete_cmd.size);
-        if (!nl)
-         break; /* still incomplete */
-
-        /* Length including newline */
-        {
-            size_t cmd_len = (size_t)(nl - base) + 1;
-            const char *overwritten_ptr = NULL;
-
-            if (dev->cmd_history.full) {
-                uint8_t idx = dev->cmd_history.in_offs;
-                overwritten_ptr = dev->cmd_history.entry[idx].buffptr;
-            }
-
-            /* Allocating buffer for this completed command */
-            char *final_buf = kmalloc(cmd_len, GFP_KERNEL);
-            if (!final_buf) 
-            { 
-             retval = -ENOMEM;
-             goto out_unlock_free;
-            }
-
-            memcpy(final_buf, base, cmd_len);
-
-            /* Pushing into teh circular buffer*/
-
-            struct aesd_buffer_entry e = { .buffptr = (const char *)final_buf, .size = cmd_len };
-            aesd_circular_buffer_add_entry(&dev->cmd_history, &e);
-
-            /* Free the overwritten entry */
-            if (overwritten_ptr)
-              kfree((void *)overwritten_ptr);
-
-            /* checking any tail after the newline as the new incomplete_cmd */
-            {
-                size_t tail_len = dev->incomplete_cmd.size - cmd_len;
-                if (tail_len == 0) 
-                {
-                    kfree((void *)dev->incomplete_cmd.buffptr);
-                    dev->incomplete_cmd.buffptr = NULL;
-                    dev->incomplete_cmd.size = 0;
-                } else {
-                    char *tail = kmalloc(tail_len, GFP_KERNEL);
-                    if (!tail) {
-                     retval = -ENOMEM; 
-                     goto out_unlock_free; 
-                    }
-                    memcpy(tail, base + cmd_len, tail_len);
-                    kfree((void *)dev->incomplete_cmd.buffptr);
-                    dev->incomplete_cmd.buffptr = (const char *)tail;
-                    dev->incomplete_cmd.size = tail_len;
-                }
+        if (dev->circbuf.full) {
+            slot_to_free = &dev->circbuf.entry[dev->circbuf.in_offs];
+            if (slot_to_free->buffptr) {
+                kfree(slot_to_free->buffptr);
+                slot_to_free->buffptr = NULL;
+                slot_to_free->size = 0;
             }
         }
-        /* Loop in case multiple '\n' exist in the now-updated incomplete_cmd */
+
+        aesd_circular_buffer_add_entry(&dev->circbuf, &new_entry);
+
+        memmove(dev->partial_buf,
+                dev->partial_buf + cmd_len,
+                dev->partial_size - cmd_len);
+        dev->partial_size -= cmd_len;
     }
 
-  out_unlock_free:
+out_unlock:
     mutex_unlock(&dev->lock);
-    kfree(kbuf);
     return retval;
 }
-struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+
+static const struct file_operations aesd_fops = {
+    .owner   = THIS_MODULE,
+    .open    = aesd_open,
+    .release = aesd_release,
+    .read    = aesd_read,
+    .write   = aesd_write,
     .llseek  = default_llseek,
 };
 
@@ -266,49 +233,47 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
- 
-    mutex_init(&aesd_device.lock);                 
-    aesd_circular_buffer_init(&aesd_device.cmd_history); 
-    aesd_device.incomplete_cmd.buffptr = NULL;
-    aesd_device.incomplete_cmd.size = 0;
+    mutex_init(&aesd_device.lock);
+
+    aesd_circular_buffer_init(&aesd_device.circbuf);
+
+    aesd_device.partial_buf      = NULL;
+    aesd_device.partial_size     = 0;
+    aesd_device.partial_capacity = 0;
 
     result = aesd_setup_cdev(&aesd_device);
-
-    if( result ) {
+    if (result) {
         unregister_chrdev_region(dev, 1);
     }
-    return result;
 
+    return result;
 }
 
 void aesd_cleanup_module(void)
 {
-      struct aesd_buffer_entry *entry;
     dev_t devno = MKDEV(aesd_major, aesd_minor);
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
 
     cdev_del(&aesd_device.cdev);
 
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
- 
-    uint8_t idx;
-
-    /* Free all command-history entries */
-    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.cmd_history, idx) {
-    if (entry->buffptr) {
-        kfree(entry->buffptr);
-        entry->buffptr = NULL;
-        entry->size = 0;
+    for (index = 0; index < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; index++) {
+        entry = &aesd_device.circbuf.entry[index];
+        if (entry->buffptr) {
+            kfree(entry->buffptr);
+            entry->buffptr = NULL;
+            entry->size = 0;
         }
     }
+    kfree(aesd_device.partial_buf);
+    aesd_device.partial_buf      = NULL;
+    aesd_device.partial_size     = 0;
+    aesd_device.partial_capacity = 0;
 
-    /* Free any partially collected write-buffer */
-    if (aesd_device.incomplete_cmd.buffptr) {
-        kfree(aesd_device.incomplete_cmd.buffptr);
-        aesd_device.incomplete_cmd.buffptr = NULL;
-        aesd_device.incomplete_cmd.size = 0;
-    }
+    mutex_destroy(&aesd_device.lock);
 
     unregister_chrdev_region(devno, 1);
 }
