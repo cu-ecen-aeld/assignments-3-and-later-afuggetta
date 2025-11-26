@@ -15,9 +15,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1   /* default ON for assignment 8 */
+#endif
+
 #define LISTEN_PORT 9000
 #define BACKLOG 10
-#ifdef USE_AESD_CHAR_DEVICE
+#if USE_AESD_CHAR_DEVICE
 #define DATAFILE "/dev/aesdchar"
 #else
 #define DATAFILE "/var/tmp/aesdsocketdata"
@@ -28,7 +32,7 @@ static int server_fd = -1;
 /* Mutex to protect all writes (and read+write sequences) to DATAFILE */
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#ifndef USE_AESD_CHAR_DEVICE
+#if !USE_AESD_CHAR_DEVICE
 // Thread for writing timestamp (only used when not using aesdchar)
 /* Timer thread for periodic timestamp */
 static pthread_t timer_thread;
@@ -151,7 +155,7 @@ static int send_file_to_client_nolock(int client_fd)
     return (r < 0) ? -1 : 0;
 }
 
-#ifndef USE_AESD_CHAR_DEVICE
+#if !USE_AESD_CHAR_DEVICE
 /* ========== Timer thread: append timestamp every 10s ========== */
 
 static void *timestamp_thread_func(void *arg)
@@ -433,7 +437,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-#ifndef USE_AESD_CHAR_DEVICE
+#if !USE_AESD_CHAR_DEVICE
     // Make sure data file exists
     int df = open(DATAFILE, O_CREAT | O_APPEND, 0644);
     if (df != -1) close(df);
@@ -505,7 +509,7 @@ int main(int argc, char *argv[])
         server_fd = -1;
     }
 
-#ifndef USE_AESD_CHAR_DEVICE
+#if !USE_AESD_CHAR_DEVICE
     /* Wait for timer thread to exit */
     pthread_join(timer_thread, NULL);
 #endif
@@ -513,7 +517,7 @@ int main(int argc, char *argv[])
     thread_list_join_all();
 
     pthread_mutex_destroy(&data_mutex);
-#ifndef USE_AESD_CHAR_DEVICE
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATAFILE);
 #endif
     closelog();
