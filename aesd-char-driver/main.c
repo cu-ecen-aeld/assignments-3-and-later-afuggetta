@@ -30,210 +30,183 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
-int aesd_open(struct inode *inode, struct file *filp)
-{
-    PDEBUG("open");
-    /**
-     * TODO: handle open
-     */
-    filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
-    return 0;
-}
-
-int aesd_release(struct inode *inode, struct file *filp)
-{
-    PDEBUG("release");
-    /**
-     * TODO: handle release
-     */
-    filp->private_data = NULL;
-    return 0;
-}
-
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static int aesd_open(struct inode *inode, struct file *filp)
 {
     struct aesd_dev *dev;
-    struct aesd_buffer_entry *entry = NULL;
-    size_t entry_byte_off = 0;
-    size_t bytes_avail_in_entry;
-    size_t bytes_to_copy;
-    ssize_t ret;
-    PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
-    /**
-     * TODO: handle read
-     */
-   
-   if (!filp || !buf || !f_pos) {
-        PDEBUG("read: invalid args filp=%p buf=%p f_pos=%p", filp, buf, f_pos);
-        return -EINVAL;
-    }
-    if (count == 0)
-        return 0;
-
-    dev = filp->private_data;
-
-
-    if (mutex_lock_interruptible(&dev->lock)) {
-        PDEBUG("read: mutex_lock_interruptible interrupted");
-        return -ERESTARTSYS;
-    }
-
-    /* Map the linear file position */
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->cmd_history, (size_t)*f_pos, &entry_byte_off);
-    if (!entry) {
-        mutex_unlock(&dev->lock);
-        return 0; 
-    }
-
-    bytes_avail_in_entry = entry->size - entry_byte_off;
-    bytes_to_copy = (bytes_avail_in_entry < count) ? bytes_avail_in_entry : count;
-
-    if (copy_to_user(buf, (const char *)entry->buffptr + entry_byte_off, bytes_to_copy)) 
-    {
-        PDEBUG("read: copy_to_user failed (req=%zu)", bytes_to_copy);
-        mutex_unlock(&dev->lock);
-        return -EFAULT;
-    }
-
-    *f_pos += bytes_to_copy;
-    ret = (ssize_t)bytes_to_copy;
-
-    PDEBUG("read: copied=%zu new f_pos=%lld", bytes_to_copy, *f_pos);
-    mutex_unlock(&dev->lock);
-    return ret;
+    dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
+    filp->private_data = dev;
+    return 0;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count, loff_t *f_pos)
+static int aesd_release(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+static ssize_t aesd_read(struct file *filp, char __user *buf,
+                         size_t count, loff_t *f_pos)
 {
     struct aesd_dev *dev = filp->private_data;
-    char *kbuf = NULL;
-    ssize_t retval = count;
-    void *newptr;
-    size_t newsize;
+    ssize_t total_read = 0;
+    size_t offset;
+    struct aesd_buffer_entry *entry;
+    size_t entry_off;
+    size_t to_copy;
 
-    if (!filp || !ubuf || !f_pos) {
-        PDEBUG("write: invalid args filp=%p buf=%p f_pos=%p", filp, ubuf, f_pos);
-        return -EINVAL;
-    }
-
-    if (count == 0)
-        return 0;
-
-    dev = filp->private_data;
     if (!dev)
         return -EFAULT;
 
-    kbuf = kmalloc(count, GFP_KERNEL);
-    if (!kbuf) {
-        PDEBUG("write: kmalloc failed for %zu bytes", count);
-        return -ENOMEM;
-    }
-
-    if (copy_from_user(kbuf, ubuf, count)) {
-        PDEBUG("write: copy_from_user failed");
-        kfree(kbuf);
-        return -EFAULT;
-    }
-
-    if (mutex_lock_interruptible(&dev->lock)) {
-        PDEBUG("write: mutex_lock_interruptible interrupted");
-        kfree(kbuf);
+    if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
+
+    offset = *f_pos;
+
+    while (count > 0) {
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->buffer, offset, &entry_off);
+        if (!entry || entry->size == 0) {
+            /* No more data available */
+            break;
+        }
+
+        to_copy = entry->size - entry_off;
+        if (to_copy > count)
+            to_copy = count;
+
+        if (copy_to_user(buf + total_read,
+                         entry->buffptr + entry_off,
+                         to_copy)) {
+            if (total_read == 0)
+                total_read = -EFAULT;
+            goto out_unlock;
+        }
+
+        total_read += to_copy;
+        offset     += to_copy;
+        count      -= to_copy;
     }
 
+    *f_pos = offset;
 
-    /* Append this user chunk to the accumulating buffer */
-    newsize = dev->incomplete_cmd.size + count;
-    newptr  = krealloc((void *)dev->incomplete_cmd.buffptr, newsize, GFP_KERNEL);
-    if (!newptr) 
-    {
-      retval = -ENOMEM; 
-      goto out_unlock_free; 
+out_unlock:
+    mutex_unlock(&dev->lock);
+    return total_read;
+}
+
+static ssize_t aesd_write(struct file *filp, const char __user *buf,
+                          size_t count, loff_t *f_pos)
+{
+    struct aesd_dev *dev = filp->private_data;
+    ssize_t retval = count;
+    char *user_buf = NULL;
+    char *combined = NULL;
+    size_t needed;
+    size_t pos = 0;
+    size_t i;
+
+    (void)f_pos; /* Ignored for this assignment */
+
+    if (!dev)
+        return -EFAULT;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    /* Copy user data */
+    user_buf = kmalloc(count, GFP_KERNEL);
+    if (!user_buf) {
+        retval = -ENOMEM;
+        goto out_unlock;
     }
 
-    dev->incomplete_cmd.buffptr = (const char *)newptr;
+    if (copy_from_user(user_buf, buf, count)) {
+        retval = -EFAULT;
+        goto out_unlock;
+    }
 
-    memcpy((char *)dev->incomplete_cmd.buffptr + dev->incomplete_cmd.size, kbuf, count);
+    /* Build combined = partial_buf + user_buf */
+    needed = dev->partial_size + count;
+    combined = kmalloc(needed, GFP_KERNEL);
+    if (!combined) {
+        retval = -ENOMEM;
+        goto out_unlock;
+    }
 
-    dev->incomplete_cmd.size = newsize;
+    if (dev->partial_buf && dev->partial_size > 0)
+        memcpy(combined, dev->partial_buf, dev->partial_size);
 
-    /*complete commands present in the accumulated buffer */
-    for (;;) {
-        char *base = (char *)dev->incomplete_cmd.buffptr;
-        char *nl;
+    memcpy(combined + dev->partial_size, user_buf, count);
 
-        if (!base || dev->incomplete_cmd.size == 0)
-         break;
-        nl = memchr(base, '\n', dev->incomplete_cmd.size);
-        if (!nl)
-         break; /* still incomplete */
+    /* We no longer need old partial */
+    kfree(dev->partial_buf);
+    dev->partial_buf  = NULL;
+    dev->partial_size = 0;
 
-        /* Length including newline */
-        {
-            size_t cmd_len = (size_t)(nl - base) + 1;
-            const char *overwritten_ptr = NULL;
+    /* Parse combined for complete lines ending in '\n' */
+    pos = 0;
+    for (i = 0; i < needed; i++) {
+        if (combined[i] == '\n') {
+            size_t line_len = i - pos + 1; /* include '\n' */
+            struct aesd_buffer_entry new_entry;
+            struct aesd_buffer_entry *old_entry;
 
-            if (dev->cmd_history.full) {
-                uint8_t idx = dev->cmd_history.in_offs;
-                overwritten_ptr = dev->cmd_history.entry[idx].buffptr;
+            new_entry.buffptr = kmalloc(line_len, GFP_KERNEL);
+            if (!new_entry.buffptr) {
+                retval = -ENOMEM;
+                goto out_unlock;
             }
+            new_entry.size = line_len;
+            memcpy((char *)new_entry.buffptr, combined + pos, line_len);
 
-            /* Allocating buffer for this completed command */
-            char *final_buf = kmalloc(cmd_len, GFP_KERNEL);
-            if (!final_buf) 
-            { 
-             retval = -ENOMEM;
-             goto out_unlock_free;
-            }
-
-            memcpy(final_buf, base, cmd_len);
-
-            /* Pushing into teh circular buffer*/
-
-            struct aesd_buffer_entry e = { .buffptr = (const char *)final_buf, .size = cmd_len };
-            aesd_circular_buffer_add_entry(&dev->cmd_history, &e);
-
-            /* Free the overwritten entry */
-            if (overwritten_ptr)
-              kfree((void *)overwritten_ptr);
-
-            /* checking any tail after the newline as the new incomplete_cmd */
-            {
-                size_t tail_len = dev->incomplete_cmd.size - cmd_len;
-                if (tail_len == 0) 
-                {
-                    kfree((void *)dev->incomplete_cmd.buffptr);
-                    dev->incomplete_cmd.buffptr = NULL;
-                    dev->incomplete_cmd.size = 0;
-                } else {
-                    char *tail = kmalloc(tail_len, GFP_KERNEL);
-                    if (!tail) {
-                     retval = -ENOMEM; 
-                     goto out_unlock_free; 
-                    }
-                    memcpy(tail, base + cmd_len, tail_len);
-                    kfree((void *)dev->incomplete_cmd.buffptr);
-                    dev->incomplete_cmd.buffptr = (const char *)tail;
-                    dev->incomplete_cmd.size = tail_len;
+            /*
+             * If buffer is full, next add will overwrite entry at in_offs.
+             * Free that entry first.
+             */
+            if (dev->buffer.full) {
+                old_entry = &dev->buffer.entry[dev->buffer.in_offs];
+                if (old_entry->buffptr) {
+                    kfree(old_entry->buffptr);
+                    old_entry->buffptr = NULL;
+                    old_entry->size = 0;
                 }
             }
+
+            aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
+
+            pos = i + 1; /* start of next potential line */
         }
-        /* Loop in case multiple '\n' exist in the now-updated incomplete_cmd */
     }
 
-  out_unlock_free:
+    /* Remaining bytes after last '\n' become new partial */
+    if (pos < needed) {
+        dev->partial_size = needed - pos;
+        dev->partial_buf  = kmalloc(dev->partial_size, GFP_KERNEL);
+        if (!dev->partial_buf) {
+            retval = -ENOMEM;
+            goto out_unlock;
+        }
+        memcpy(dev->partial_buf, combined + pos, dev->partial_size);
+    } else {
+        dev->partial_buf  = NULL;
+        dev->partial_size = 0;
+    }
+
+out_unlock:
+    if (combined)
+        kfree(combined);
+    if (user_buf)
+        kfree(user_buf);
     mutex_unlock(&dev->lock);
-    kfree(kbuf);
     return retval;
 }
-struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
-    .llseek  = default_llseek,
+
+static const struct file_operations aesd_fops = {
+    .owner   = THIS_MODULE,
+    .open    = aesd_open,
+    .release = aesd_release,
+    .read    = aesd_read,
+    .write   = aesd_write,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -268,49 +241,41 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
- 
-    mutex_init(&aesd_device.lock);                 
-    aesd_circular_buffer_init(&aesd_device.cmd_history); 
-    aesd_device.incomplete_cmd.buffptr = NULL;
-    aesd_device.incomplete_cmd.size = 0;
+    aesd_circular_buffer_init(&aesd_device.buffer);
+    mutex_init(&aesd_device.lock);
+
+    aesd_device.partial_buf      = NULL;
+    aesd_device.partial_size     = 0;
 
     result = aesd_setup_cdev(&aesd_device);
-
-    if( result ) {
+    if (result) {
         unregister_chrdev_region(dev, 1);
     }
-    return result;
 
+    return result;
 }
 
 void aesd_cleanup_module(void)
 {
-      struct aesd_buffer_entry *entry;
     dev_t devno = MKDEV(aesd_major, aesd_minor);
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
 
     cdev_del(&aesd_device.cdev);
 
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
- 
-   uint8_t idx;
-
-   /* Free all command-history entries */
-    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.cmd_history, idx) {
-    if (entry->buffptr) {
-        kfree(entry->buffptr);
-        entry->buffptr = NULL;
-        entry->size = 0;
-        }
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index) {
+        if (entry->buffptr)
+            kfree(entry->buffptr);
     }
+    if (aesd_device.partial_buf)
+        kfree(aesd_device.partial_buf);
+    aesd_device.partial_buf      = NULL;
+    aesd_device.partial_size     = 0;
 
-   /* Free any partially collected write-buffer */
-  if (aesd_device.incomplete_cmd.buffptr) {
-        kfree(aesd_device.incomplete_cmd.buffptr);
-        aesd_device.incomplete_cmd.buffptr = NULL;
-        aesd_device.incomplete_cmd.size = 0;
-    }
+    mutex_destroy(&aesd_device.lock);
 
     unregister_chrdev_region(devno, 1);
 }
