@@ -28,14 +28,14 @@
 #include <linux/mutex.h>
 #endif
 #include "aesd-circular-buffer.h"
-#define WAITING_BUFFER_SIZE 50
+
 struct aesd_dev
 {
     struct cdev cdev;                     /* Char device structure      */
-    struct aesd_circular_buffer circ_buf;
-    const char waiting_bfr[WAITING_BUFFER_SIZE];
-    uint8_t waiting_bfr_offset;
-    struct mutex lock;
+    struct aesd_circular_buffer buffer;   /* Our circular buffer        */
+    struct mutex lock;                    /* Mutex for read/write       */
+    char   *partial_buf;                  /* Accumulated partial command*/
+    size_t  partial_size;                 /* Size of partial_buf        */
 };
 
 int aesd_open(struct inode *inode, struct file *filp);
