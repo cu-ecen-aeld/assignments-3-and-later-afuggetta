@@ -14,6 +14,8 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include "aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1   /* default ON */
@@ -43,6 +45,9 @@ struct client_thread {
     int client_fd;
     char client_ip[INET6_ADDRSTRLEN];
     volatile sig_atomic_t complete;  // set by thread when done
+#if USE_AESD_CHAR_DEVICE
+    int data_fd;   /* fd for /dev/aesdchar */
+#endif
     struct client_thread *next;
 };
 
@@ -65,6 +70,35 @@ static void signal_handler(int signo)
         shutdown(server_fd, SHUT_RDWR);
     }
 }
+
+#if USE_AESD_CHAR_DEVICE
+static int send_from_fd_nolock(int client_fd, int data_fd)
+{
+    char buf[4096];
+    ssize_t r;
+
+    /* read from current file position until EOF */
+    while ((r = read(data_fd, buf, sizeof(buf))) > 0) {
+        size_t sent = 0;
+        while (sent < (size_t)r) {
+            ssize_t s = send(client_fd, buf + sent, (size_t)r - sent, 0);
+            if (s < 0) {
+                if (errno == EINTR) continue;
+                syslog(LOG_USER | LOG_ERR, "send failed: %m");
+                return -1;
+            }
+            sent += (size_t)s;
+        }
+    }
+
+    if (r < 0) {
+        syslog(LOG_USER | LOG_ERR, "read from aesdchar failed: %m");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 
 static int install_signal_handlers(void)
 {
@@ -278,6 +312,16 @@ static void *client_thread_func(void *arg)
         return NULL;
     }
 
+#if USE_AESD_CHAR_DEVICE
+    info->data_fd = open(DATAFILE, O_RDWR);
+    if (info->data_fd == -1) {
+        syslog(LOG_USER | LOG_ERR, "open %s failed: %m", DATAFILE);
+        free(packet);
+        info->complete = 1;
+        return NULL;
+    }
+#endif
+
     syslog(LOG_USER | LOG_INFO, "Handling connection from %s", info->client_ip);
 
     bool client_open = true;
@@ -324,12 +368,74 @@ static void *client_thread_func(void *arg)
                     client_open = false;
                     break;
                 }
-                
-                int flags = O_WRONLY;
-#if !USE_AESD_CHAR_DEVICE
-                flags |= O_CREAT | O_APPEND;
-#endif
-                int afd = open(DATAFILE, flags, 0644);
+
+#if USE_AESD_CHAR_DEVICE
+                /* Check for AESDCHAR_IOCSEEKTO:X,Y\n */
+                const char *prefix = "AESDCHAR_IOCSEEKTO:";
+                size_t prefix_len = strlen(prefix);
+                bool is_seek_cmd = false;
+
+                if (line_len > prefix_len &&
+                    strncmp(packet + start, prefix, prefix_len) == 0) {
+
+                    unsigned int cmd_idx, cmd_off;
+                    if (sscanf(packet + start + prefix_len, "%u,%u",
+                            &cmd_idx, &cmd_off) == 2) {
+                        struct aesd_seekto seekto;
+                        seekto.write_cmd = cmd_idx;
+                        seekto.write_cmd_offset = cmd_off;
+
+                        if (ioctl(info->data_fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+                            syslog(LOG_USER | LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %m");
+                            pthread_mutex_unlock(&data_mutex);
+                            client_open = false;
+                            break;
+                        }
+
+                        /* After ioctl, read from current offset */
+                        if (send_from_fd_nolock(client_fd, info->data_fd) == -1) {
+                            pthread_mutex_unlock(&data_mutex);
+                            client_open = false;
+                            break;
+                        }
+
+                        is_seek_cmd = true;
+                    }
+                }
+
+                if (!is_seek_cmd) {
+                    /* Normal write path: write the line into the device, then
+                    * rewind to start and send whole contents.
+                    */
+                    ssize_t w = write(info->data_fd, packet + start, line_len);
+                    if (w < 0 || (size_t)w != line_len) {
+                        syslog(LOG_USER | LOG_ERR, "write to %s failed: %m", DATAFILE);
+                        pthread_mutex_unlock(&data_mutex);
+                        client_open = false;
+                        break;
+                    }
+
+                    /* For normal commands, we want to send all content
+                    * from the beginning of the device.
+                    */
+                    if (lseek(info->data_fd, 0, SEEK_SET) == (off_t)-1) {
+                        syslog(LOG_USER | LOG_ERR, "lseek to start failed: %m");
+                        pthread_mutex_unlock(&data_mutex);
+                        client_open = false;
+                        break;
+                    }
+
+                    if (send_from_fd_nolock(client_fd, info->data_fd) == -1) {
+                        pthread_mutex_unlock(&data_mutex);
+                        client_open = false;
+                        break;
+                    }
+                }
+
+#else   /* !USE_AESD_CHAR_DEVICE */
+
+                /* Original file-backed behavior */
+                int afd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
                 if (afd == -1) {
                     syslog(LOG_USER | LOG_ERR, "open %s for append failed: %m", DATAFILE);
                     pthread_mutex_unlock(&data_mutex);
@@ -352,9 +458,8 @@ static void *client_thread_func(void *arg)
                     client_open = false;
                     break;
                 }
-
+#endif /* USE_AESD_CHAR_DEVICE */
                 pthread_mutex_unlock(&data_mutex);
-
                 start = i + 1;
             }
         }
@@ -372,6 +477,11 @@ static void *client_thread_func(void *arg)
     free(packet);
     syslog(LOG_USER | LOG_INFO, "Closed connection from %s", info->client_ip);
     close(client_fd);
+
+#if USE_AESD_CHAR_DEVICE
+    if (info->data_fd >= 0)
+        close(info->data_fd);
+#endif
 
     info->complete = 1;
     return NULL;
