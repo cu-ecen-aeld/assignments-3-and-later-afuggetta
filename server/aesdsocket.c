@@ -324,9 +324,12 @@ static void *client_thread_func(void *arg)
                     client_open = false;
                     break;
                 }
-
+                
+                int flags = O_WRONLY;
 #if !USE_AESD_CHAR_DEVICE
-                int afd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                flags |= O_CREAT | O_APPEND;
+#endif
+                int afd = open(DATAFILE, flags, 0644);
                 if (afd == -1) {
                     syslog(LOG_USER | LOG_ERR, "open %s for append failed: %m", DATAFILE);
                     pthread_mutex_unlock(&data_mutex);
@@ -343,7 +346,7 @@ static void *client_thread_func(void *arg)
                     break;
                 }
                 close(afd);
-#endif
+
                 if (send_file_to_client_nolock(client_fd) == -1) {
                     pthread_mutex_unlock(&data_mutex);
                     client_open = false;
