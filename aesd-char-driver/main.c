@@ -49,7 +49,9 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     struct aesd_dev *dev = filp->private_data;
     ssize_t total_read = 0;
     size_t offset;
+    struct aesd_buffer_entry *entry;
     size_t entry_off;
+    size_t to_copy;
 
     if (!dev)
         return -EFAULT;
@@ -62,9 +64,6 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     offset = *f_pos;
 
     while (count > 0) {
-        struct aesd_buffer_entry *entry;
-        size_t to_copy;
-
         entry = aesd_circular_buffer_find_entry_offset_for_fpos(
                     &dev->circbuf, offset, &entry_off);
         if (!entry)
@@ -121,7 +120,7 @@ static int aesd_append_partial(struct aesd_dev *dev,
             memcpy(newbuf, dev->partial_buf, dev->partial_size);
 
         kfree(dev->partial_buf);
-        dev->partial_buf = newbuf;
+        dev->partial_buf      = newbuf;
         dev->partial_capacity = new_cap;
     }
 
@@ -139,44 +138,38 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     struct aesd_dev *dev = filp->private_data;
     ssize_t retval = count;
     int err;
+    char *newline;
+    size_t cmd_len;
+    struct aesd_buffer_entry new_entry;
+    struct aesd_buffer_entry *slot_to_free;
 
     if (!dev)
         return -EFAULT;
 
     mutex_lock(&dev->lock);
 
-    /* 1) Append incoming data to partial command buffer */
     err = aesd_append_partial(dev, buf, count);
-    if (err) {
+    if (err < 0) {
         retval = err;
         goto out_unlock;
     }
 
-    /* 2) While we can find a '\n', extract a full command */
     while (1) {
-        char *newline;
-        size_t cmd_len;
-        struct aesd_buffer_entry new_entry;
-        struct aesd_buffer_entry *slot_to_free;
-
         newline = memchr(dev->partial_buf, '\n', dev->partial_size);
         if (!newline)
-            break; /* no complete command yet */
+            break; 
 
-        cmd_len = (newline - dev->partial_buf) + 1; /* include '\n' */
+        cmd_len = (newline - dev->partial_buf) + 1;
 
         new_entry.buffptr = kmalloc(cmd_len, GFP_KERNEL);
         if (!new_entry.buffptr) {
             retval = -ENOMEM;
             goto out_unlock;
         }
+
         memcpy((char *)new_entry.buffptr, dev->partial_buf, cmd_len);
         new_entry.size = cmd_len;
 
-        /*
-         * If circular buffer is full, the next write will overwrite
-         * entry at circbuf.in_offs. Free it first.
-         */
         if (dev->circbuf.full) {
             slot_to_free = &dev->circbuf.entry[dev->circbuf.in_offs];
             if (slot_to_free->buffptr) {
@@ -188,14 +181,12 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
 
         aesd_circular_buffer_add_entry(&dev->circbuf, &new_entry);
 
-        /* Remove this command from partial_buf (keep leftovers) */
         memmove(dev->partial_buf,
                 dev->partial_buf + cmd_len,
                 dev->partial_size - cmd_len);
         dev->partial_size -= cmd_len;
     }
 
-    /* We ignore *f_pos for writes in this assignment */
 out_unlock:
     mutex_unlock(&dev->lock);
     return retval;
@@ -263,7 +254,7 @@ void aesd_cleanup_module(void)
     dev_t devno = MKDEV(aesd_major, aesd_minor);
     uint8_t index;
     struct aesd_buffer_entry *entry;
-    
+
     cdev_del(&aesd_device.cdev);
 
     /**
