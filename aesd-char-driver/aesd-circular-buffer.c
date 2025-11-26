@@ -34,7 +34,6 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(
     uint8_t entries;
     uint8_t read_idx;
     uint8_t i;
-    size_t  remaining;
 
     if (!buffer)
         return NULL;
