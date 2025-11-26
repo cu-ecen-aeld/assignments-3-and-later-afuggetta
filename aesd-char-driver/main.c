@@ -83,11 +83,6 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
 {
     struct aesd_dev *dev = filp->private_data;
     ssize_t retval = count;
-    int err;
-    char *newline;
-    size_t cmd_len;
-    
-    struct aesd_buffer_entry *slot_to_free;
 
     if (!dev)
         return -EFAULT;
@@ -134,12 +129,12 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
             kfree((void *)dev->buffer.entry[dev->buffer.out_offs].buffptr);
         }
 
-        aesd_circular_buffer_add_entry(&dev->circbuf, &new_entry);
+        aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
 
         dev->partial_size = needed - (i + 1);
         if (dev->partial_size > 0)
         {
-            dev->partial_buf = kmalloc(dev->partial_size, GP_KERNEL);
+            dev->partial_buf = kmalloc(dev->partial_size, GFP_KERNEL);
             if (!dev->partial_buf)
             {
                 retval = -ENOMEM;
@@ -149,7 +144,7 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
         } else
         {
             dev->partial_buf = NULL;
-            dev->partial_size - 0;
+            dev->partial_size = 0;
         }
 
         retval = count;
@@ -157,7 +152,7 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     }
 
     kfree(dev->partial_buf);
-    dev->partial_buf = kmalloc(needed, GP_KERNEL);
+    dev->partial_buf = kmalloc(needed, GFP_KERNEL);
     memcpy(dev->partial_buf, newbuf, needed);
     retval = count;
 
@@ -208,7 +203,7 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
-    aesd_circular_buffer_init(&aesd_device.circbuf);
+    aesd_circular_buffer_init(&aesd_device.buffer);
     mutex_init(&aesd_device.lock);
 
     aesd_device.partial_buf      = NULL;
@@ -241,7 +236,6 @@ void aesd_cleanup_module(void)
         kfree(aesd_device.partial_buf);
     aesd_device.partial_buf      = NULL;
     aesd_device.partial_size     = 0;
-    aesd_device.partial_capacity = 0;
 
     mutex_destroy(&aesd_device.lock);
 
