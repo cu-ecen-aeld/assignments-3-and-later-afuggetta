@@ -26,22 +26,18 @@
 #ifdef __KERNEL__
 #include <linux/cdev.h>
 #include <linux/mutex.h>
-#include "aesd-circular-buffer.h"
 #endif
+#include "aesd-circular-buffer.h"
 
 struct aesd_dev
 {
     struct cdev cdev;                 /* Char device structure */
-
-#ifdef __KERNEL__
-    struct mutex lock;                /* Protects circbuf + partial buffer */
-    struct aesd_circular_buffer circbuf;
+    struct mutex lock;                /* Protects buffer + partial buffer */
+    struct aesd_circular_buffer buffer;
 
     /* Buffer to accumulate a single command until '\n' is received */
     char   *partial_buf;
     size_t  partial_size;
-    size_t  partial_capacity;
-#endif
 };
 
 

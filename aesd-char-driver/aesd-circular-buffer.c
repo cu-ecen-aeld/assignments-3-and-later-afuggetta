@@ -40,27 +40,31 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(
         return NULL;
 
     /* How many valid entries do we have? */
-    entries = buffer->full ?
-        AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED :
-        buffer->in_offs;
+    if (buffer->full)
+    {
+        entries = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else
+    {
+        entries= (buffer->in_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buffer->out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
 
     if (entries == 0)
         return NULL; /* Buffer empty */
 
     read_idx  = buffer->out_offs;
-    remaining = char_offset;
-
+    size_t total_size = 0;
+    // now I need to iterate through the entries
     for (i = 0; i < entries; i++) {
-        struct aesd_buffer_entry *entry = &buffer->entry[read_idx];
+        size_t current_size = buffer->entry[read_idx].size;
 
-        if (remaining < entry->size) {
+        if (char_offset < total_size + current_size) {
             /* Offset falls within this entry */
             if (entry_offset_byte_rtn)
-                *entry_offset_byte_rtn = remaining;
-            return entry;
+                *entry_offset_byte_rtn = char_offset - total_size;
+            return &buffer->entry[read_idx];
         }
 
-        remaining -= entry->size;
+        total_size += current_size;
         read_idx = (read_idx + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
 
@@ -84,15 +88,15 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     if (!buffer || !add_entry)
         return;
 
-    /* Store new entry at in_offs */
-    buffer->entry[buffer->in_offs] = *add_entry;
-
     /* If already full, we're overwriting the oldest entry */
     if (buffer->full) {
         buffer->out_offs =
             (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
 
+    /* Store new entry at in_offs */
+    buffer->entry[buffer->in_offs] = *add_entry;
+    
     buffer->in_offs =
         (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 

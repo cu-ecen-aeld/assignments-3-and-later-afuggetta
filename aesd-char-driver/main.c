@@ -17,6 +17,7 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
+#include <linux/mutex.h>
 #include "aesdchar.h"
 #include "aesd-circular-buffer.h"
 
@@ -53,83 +54,28 @@ static ssize_t aesd_read(struct file *filp, char __user *buf,
     size_t entry_off;
     size_t to_copy;
 
-    if (!dev)
-        return -EFAULT;
+    if(mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
 
-    if (count == 0)
-        return 0;
-
-    mutex_lock(&dev->lock);
-
-    offset = *f_pos;
-
-    while (count > 0) {
-        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-                    &dev->circbuf, offset, &entry_off);
-        if (!entry)
-            break; /* no more data => EOF */
-
-        to_copy = entry->size - entry_off;
-        if (to_copy > count)
-            to_copy = count;
-
-        if (copy_to_user(buf, entry->buffptr + entry_off, to_copy)) {
-            if (total_read == 0)
-                total_read = -EFAULT;
-            goto out_unlock;
-        }
-
-        buf        += to_copy;
-        count      -= to_copy;
-        offset     += to_copy;
-        total_read += to_copy;
+    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer);
+    if(!entry || entry->size == 0)
+    {
+        total_read = 0;
+        goto out_unlock;
     }
 
-    *f_pos = offset;
+    if (copy_to_user(buf, entry->buffptr + entry_off, to_copy)) {
+        if (total_read == 0)
+            total_read = -EFAULT;
+        goto out_unlock;
+    }
+
+    *f_pos += to_copy;
+    total_read = to_copy;
 
 out_unlock:
     mutex_unlock(&dev->lock);
     return total_read;
-}
-
-
-static int aesd_append_partial(struct aesd_dev *dev,
-                               const char __user *buf,
-                               size_t count)
-{
-    size_t needed;
-    char *newbuf;
-
-    if (!dev || !buf || count == 0)
-        return 0;
-
-    needed = dev->partial_size + count;
-
-    if (needed > dev->partial_capacity) {
-        size_t new_cap = dev->partial_capacity ?
-                         dev->partial_capacity * 2 :
-                         needed;
-        if (new_cap < needed)
-            new_cap = needed;
-
-        newbuf = kmalloc(new_cap, GFP_KERNEL);
-        if (!newbuf)
-            return -ENOMEM;
-
-        if (dev->partial_buf && dev->partial_size)
-            memcpy(newbuf, dev->partial_buf, dev->partial_size);
-
-        kfree(dev->partial_buf);
-        dev->partial_buf      = newbuf;
-        dev->partial_capacity = new_cap;
-    }
-
-    if (copy_from_user(dev->partial_buf + dev->partial_size, buf, count))
-        return -EFAULT;
-
-    dev->partial_size += count;
-
-    return 0;
 }
 
 static ssize_t aesd_write(struct file *filp, const char __user *buf,
@@ -140,54 +86,84 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     int err;
     char *newline;
     size_t cmd_len;
-    struct aesd_buffer_entry new_entry;
+    
     struct aesd_buffer_entry *slot_to_free;
 
     if (!dev)
         return -EFAULT;
 
-    mutex_lock(&dev->lock);
+    if(mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
 
-    err = aesd_append_partial(dev, buf, count);
-    if (err < 0) {
-        retval = err;
+    size_t needed;
+    char *newbuf;
+
+    needed = dev->partial_size + count;
+
+    newbuf = kmalloc(needed, GFP_KERNEL);
+    if (!newbuf)
+    {
+        retval = -ENOMEM;
         goto out_unlock;
     }
 
-    while (1) {
-        newline = memchr(dev->partial_buf, '\n', dev->partial_size);
-        if (!newline)
-            break; 
+    if (dev->partial_buf)
+        memcpy(newbuf, dev->partial_buf, dev->partial_size);
 
-        cmd_len = (newline - dev->partial_buf) + 1;
+    if (copy_from_user(newbuf + dev->partial_size, buf, count))
+    {
+        retval = -EFAULT;
+        goto out_unlock;
+    }
 
-        new_entry.buffptr = kmalloc(cmd_len, GFP_KERNEL);
+    for (size_t i = 0; i < needed; i++) {
+        if (newbuf[i] != '\n')
+            continue;
+
+        struct aesd_buffer_entry new_entry;
+        new_entry.size = i + 1;
+        new_entry.buffptr = kmalloc(new_entry.size, GFP_KERNEL);
         if (!new_entry.buffptr) {
             retval = -ENOMEM;
             goto out_unlock;
         }
 
-        memcpy((char *)new_entry.buffptr, dev->partial_buf, cmd_len);
-        new_entry.size = cmd_len;
+        memcpy((char *)new_entry.buffptr, newbuf, new_entry.size);
 
-        if (dev->circbuf.full) {
-            slot_to_free = &dev->circbuf.entry[dev->circbuf.in_offs];
-            if (slot_to_free->buffptr) {
-                kfree(slot_to_free->buffptr);
-                slot_to_free->buffptr = NULL;
-                slot_to_free->size = 0;
-            }
+        if (dev->buffer.full) {
+            kfree((void *)dev->buffer.entry[dev->buffer.out_offs].buffptr);
         }
 
         aesd_circular_buffer_add_entry(&dev->circbuf, &new_entry);
 
-        memmove(dev->partial_buf,
-                dev->partial_buf + cmd_len,
-                dev->partial_size - cmd_len);
-        dev->partial_size -= cmd_len;
+        dev->partial_size = needed - (i + 1);
+        if (dev->partial_size > 0)
+        {
+            dev->partial_buf = kmalloc(dev->partial_size, GP_KERNEL);
+            if (!dev->partial_buf)
+            {
+                retval = -ENOMEM;
+                goto out_unlock;
+            }
+            memcpy(dev->partial_buf, newbuf + i + 1, dev->partial_size);
+        } else
+        {
+            dev->partial_buf = NULL;
+            dev->partial_size - 0;
+        }
+
+        retval = count;
+        goto out_unlock;
     }
 
+    kfree(dev->partial_buf);
+    dev->partial_buf = kmalloc(needed, GP_KERNEL);
+    memcpy(dev->partial_buf, newbuf, needed);
+    retval = count;
+
 out_unlock:
+    if (newbuf)
+        kfree(newbuf);
     mutex_unlock(&dev->lock);
     return retval;
 }
@@ -198,7 +174,6 @@ static const struct file_operations aesd_fops = {
     .release = aesd_release,
     .read    = aesd_read,
     .write   = aesd_write,
-    .llseek  = default_llseek,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -233,13 +208,11 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
-    mutex_init(&aesd_device.lock);
-
     aesd_circular_buffer_init(&aesd_device.circbuf);
+    mutex_init(&aesd_device.lock);
 
     aesd_device.partial_buf      = NULL;
     aesd_device.partial_size     = 0;
-    aesd_device.partial_capacity = 0;
 
     result = aesd_setup_cdev(&aesd_device);
     if (result) {
@@ -260,15 +233,12 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
-    for (index = 0; index < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; index++) {
-        entry = &aesd_device.circbuf.entry[index];
-        if (entry->buffptr) {
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index) {
+        if (entry->buffptr)
             kfree(entry->buffptr);
-            entry->buffptr = NULL;
-            entry->size = 0;
-        }
     }
-    kfree(aesd_device.partial_buf);
+    if (aesd_device.partial_buf)
+        kfree(aesd_device.partial_buf);
     aesd_device.partial_buf      = NULL;
     aesd_device.partial_size     = 0;
     aesd_device.partial_capacity = 0;
